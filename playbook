@@ -1,0 +1,223 @@
+---
+- name: Patroni cluster creation
+  hosts: all
+  become: yes
+  become_method: sudo
+  
+
+  tasks:
+  - name: Update and upgrade apt packages
+    apt:
+      upgrade: yes
+      update_cache: yes
+
+  - name: Add PostgreSQL 12 repository
+    shell: sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'  && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+    when: ansible_hostname != "lb"
+    
+
+  - name: Install PostgreSQL 12
+    apt:
+      update_cache: yes
+      pkg:
+      - postgresql-12
+      - postgresql-client-12
+      - postgresql-contrib
+    when: ansible_hostname != "lb"
+
+
+  - name: Enable PostgreSQL
+    service: name=postgresql.service state=stopped enabled=yes
+    when: ansible_hostname != "lb"
+  
+  
+  - name: Create a symbolic link
+    shell: ln -s /usr/lib/postgresql/12/bin/* /usr/sbin/
+    when: ansible_hostname != "lb"
+    ignore_errors: yes
+  
+
+  - name: Install Python packages
+    apt:
+      update_cache: yes
+      pkg:
+      - python3-pip
+      - python3-dev
+      - libpq-dev
+    when: ansible_hostname != "lb"
+
+  - name: pip upgrade
+    shell: pip3 install --upgrade pip
+    when: ansible_hostname != "lb"
+
+  - name: Installing Patroni 
+    pip:
+      name:
+      - patroni
+      - python-etcd
+      - psycopg2
+    when: ansible_hostname != "lb"
+
+  - name: Install ETCD in lb node
+    apt:
+      pkg: 
+      - etcd
+      - haproxy
+    when: ansible_hostname == "lb"
+
+  - name: Configuring ETCD
+    ansible.builtin.blockinfile:
+      path: /etc/default/etcd
+      block: |
+        ETCD_NAME="patroni-my"
+        ETCD_LISTEN_PEER_URLS="http://{{ ansible_eth0.ipv4.address }}:2380"
+        ETCD_LISTEN_CLIENT_URLS="http://{{ ansible_eth0.ipv4.address }}:2379"
+        ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ ansible_eth0.ipv4.address }}:2380"
+        ETCD_INITIAL_CLUSTER="patroni-my=http://{{ ansible_eth0.ipv4.address }}:2380"
+        ETCD_ADVERTISE_CLIENT_URLS="http://{{ ansible_eth0.ipv4.address }}:2379"
+        ETCD_INITIAL_CLUSTER_TOKEN="node1"
+        ETCD_INITIAL_CLUSTER_STATE="new"
+    when: ansible_hostname == "lb"
+
+  - name: restart ETCD
+    service: name=etcd state=restarted
+    when: ansible_hostname == "lb"
+
+
+  - name: Configuring patroni.yml
+    ansible.builtin.blockinfile:
+      path: /etc/patroni.yml
+      create: yes
+      block: |
+        scope: postgres
+        name: postgresql{{ansible_hostname}}
+        restapi:
+            listen: {{ ansible_eth0.ipv4.address }}:8008
+            connect_address: {{ ansible_eth0.ipv4.address }}:8008
+        etcd:
+            host: {{ hostvars['lb']['ansible_host'] }}:2379
+        bootstrap:
+           dcs:
+               ttl: 30
+               loop_wait: 10
+               retry_timeout: 10
+               maximum_lag_on_failover: 1048576
+               postgresql:
+                   use_pg_rewind: true
+           initdb:
+           - encoding: UTF8
+           - data-checksums
+           pg_hba:
+           - host replication replicator 127.0.0.1/32 md5
+           - host replication replicator {{ hostvars['db1']['ansible_host'] }}/0 md5
+           - host replication replicator {{ hostvars['db2']['ansible_host'] }}/0 md5
+           - host all all 0.0.0.0/0 md5
+           users:
+                admin:
+                   password: admin
+                   options:
+                       - createrole
+                       - createdb
+        postgresql:
+           listen: {{ansible_eth0.ipv4.address}}:5432
+           connect_address: {{ansible_eth0.ipv4.address}}:5432
+           data_dir: /mnt/patroni
+           pgpass: /tmp/pgpass
+           authentication:
+               replication:
+                  username: replicator
+                  password: password
+               superuser:
+                 username: postgres
+                 password: password
+           parameters:
+                unix_socket_directories: '.'
+        tags:
+           nofailover: false
+           noloadbalance: false
+           clonefrom: false
+           nosync: false
+    when: ansible_hostname != "lb"
+
+  - name: Create a directory if it does not exist
+    ansible.builtin.file:
+      path: /mnt/patroni
+      state: directory
+      mode: '0700'
+      owner: postgres
+      group: postgres
+    when: ansible_hostname != "lb"
+
+
+  - name: Creating Systemd Unit File for Patroni
+    ansible.builtin.blockinfile:
+      path: /etc/systemd/system/patroni.service
+      create: yes
+      block: |    
+        [Unit]
+        Description=Runners to orchestrate a high-availability PostgreSQL
+        After=syslog.target network.target
+
+        [Service]
+        Type=simple
+
+        User=postgres
+        Group=postgres
+
+        ExecStart=/usr/local/bin/patroni /etc/patroni.yml
+        KillMode=process
+        TimeoutSec=30
+        Restart=no
+
+        [Install]
+        WantedBy=multi-user.target
+    when: ansible_hostname != "lb"
+
+  - name: Enable and reload patroni
+    systemd: daemon_reload=true name=patroni enabled=true state=restarted
+    when: ansible_hostname != "lb"
+
+  - name: Start PostgreSQL
+    service: name=postgresql state=started
+    when: ansible_hostname != "lb"
+
+  - name: Removing default config file
+    file: path=/etc/haproxy/haproxy.cfg state=absent
+    when: ansible_hostname == "lb"
+
+  - name: Configuring HAProxy
+    ansible.builtin.blockinfile:
+      path: /etc/haproxy/haproxy.cfg
+      create: yes
+      block: |    
+        global
+            maxconn 100
+
+        defaults
+            log global
+            mode tcp
+            retries 2
+            timeout client 30m
+            timeout connect 4s
+            timeout server 30m
+            timeout check 5s
+
+        listen stats
+            mode http
+            bind *:7000
+            stats enable
+            stats uri /
+
+        listen postgres
+            bind *:5000
+            option httpchk
+            http-check expect status 200
+            default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+            server postgresql_{{hostvars['db1']['ansible_host']}}_5432 {{hostvars['db1']['ansible_host']}}:5432 maxconn 100 check port 8008
+            server postgresql_{{hostvars['db2']['ansible_host']}}_5432 {{hostvars['db2']['ansible_host']}}:5432 maxconn 100 check port 8008
+    when: ansible_hostname == "lb"
+
+
+  - name: HAproxy restart and enable
+    service: name=haproxy state=restarted enabled=true
+    when: ansible_hostname == "lb"
